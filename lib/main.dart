@@ -16,6 +16,24 @@ import 'package:hive_flutter/hive_flutter.dart';
 // Must be a top-level function
 // ─────────────────────────────────────────────
 
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_map/flutter_map.dart';
+import 'package:latlong2/latlong.dart';
+import 'package:geolocator/geolocator.dart';
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:flutter_background_service/flutter_background_service.dart';
+import 'package:http/http.dart' as http;
+import 'dart:async';
+import 'dart:convert';
+import 'dart:ui';
+import 'package:hive_flutter/hive_flutter.dart';
+
+// ─────────────────────────────────────────────
+// BACKGROUND SERVICE ENTRY POINT
+// Must be a top-level function
+// ─────────────────────────────────────────────
+
 @pragma('vm:entry-point')
 void onStart(ServiceInstance service) async {
   DartPluginRegistrant.ensureInitialized();
@@ -56,13 +74,8 @@ void onStart(ServiceInstance service) async {
     ),
   );
 
-  // Use a stream — fires on every meaningful position change, no polling needed
-  Geolocator.getPositionStream(
-    locationSettings: const LocationSettings(
-      accuracy: LocationAccuracy.high,
-      distanceFilter: 1, // only fire when moved 10m — saves battery
-    ),
-  ).listen((position) async {
+  // ── Shared geofence check logic ──────────────────────────────────────────
+  Future<void> checkGeofences(Position position) async {
     final remindersBox = Hive.box('reminders');
     final triggeredBox = Hive.box('triggered');
 
@@ -79,10 +92,11 @@ void onStart(ServiceInstance service) async {
 
       final radius = (r["radius"] as num).toDouble();
       final keyStr = key.toString();
-      final alreadyTriggered = triggeredBox.get(keyStr, defaultValue: false) as bool;
+      final alreadyTriggered =
+          triggeredBox.get(keyStr, defaultValue: false) as bool;
 
       if (distance <= radius) {
-        // Inside zone — notify once, mark as triggered
+        // Inside zone — notify only once per entry
         if (!alreadyTriggered) {
           await triggeredBox.put(keyStr, true);
           await notifications.show(
@@ -93,14 +107,37 @@ void onStart(ServiceInstance service) async {
           );
         }
       } else {
-        // Outside zone — reset so it can trigger again next entry
+        // Outside zone — reset so it triggers again on next entry
         if (alreadyTriggered) {
           await triggeredBox.put(keyStr, false);
         }
       }
     }
+  }
 
-    // Notify UI of position update
+  // ── 1. Immediate startup check ───────────────────────────────────────────
+  // getPositionStream ONLY fires when the device MOVES.
+  // Without this, a user already inside a zone gets no notification
+  // until they physically move at least 1m.
+  try {
+    final initial = await Geolocator.getCurrentPosition(
+      desiredAccuracy: LocationAccuracy.high,
+    );
+    await checkGeofences(initial);
+    service.invoke('locationUpdate', {
+      'lat': initial.latitude,
+      'lng': initial.longitude,
+    });
+  } catch (_) {}
+
+  // ── 2. Continuous stream — fires on every 1m of movement ─────────────────
+  Geolocator.getPositionStream(
+    locationSettings: const LocationSettings(
+      accuracy: LocationAccuracy.high,
+      distanceFilter: 1,
+    ),
+  ).listen((position) async {
+    await checkGeofences(position);
     service.invoke('locationUpdate', {
       'lat': position.latitude,
       'lng': position.longitude,
